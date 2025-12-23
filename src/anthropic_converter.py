@@ -443,11 +443,12 @@ def convert_messages_to_contents(
                     )
                 elif item_type == "tool_result":
                     output = _extract_tool_result_output(item.get("content"))
+                    tool_name = item.get("name") or "tool"
                     parts.append(
                         {
                             "functionResponse": {
                                 "id": item.get("tool_use_id"),
-                                "name": item.get("name", ""),
+                                "name": tool_name,
                                 "response": {"output": output},
                             }
                         }
