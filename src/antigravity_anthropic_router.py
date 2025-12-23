@@ -671,7 +671,8 @@ async def anthropic_messages(
                 status_code=400, message="request conversion failed", error_type="invalid_request_error"
             )
 
-        components["model"] = "gemini-3-flash-preview-search"
+        # Use a search-capable model that确实存在于 /v1/models 列表，避免 404
+        components["model"] = "gemini-2.5-flash-search"
         components["tools"] = [{"googleSearch": {}}]
         components["system_instruction"] = _append_system_instruction(
             components.get("system_instruction"),
