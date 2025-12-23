@@ -706,15 +706,13 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
     if allow_thinking and last_assistant_first_block_type not in {None, "thinking", "redacted_thinking"}:
         allow_thinking = False
 
+    generation_config = build_generation_config(payload)
+    allow_thinking = "thinkingConfig" in generation_config
+
     contents = convert_messages_to_contents(messages, allow_thinking=allow_thinking)
     contents = reorganize_tool_messages(contents)
     system_instruction = build_system_instruction(payload.get("system"))
-    filtered_tools = filter_tools_for_antigravity(payload.get("tools"))
-    if str(model).startswith("claude-"):
-        tools = convert_anthropic_tools_to_antigravity_custom(filtered_tools)
-    else:
-        tools = convert_tools(filtered_tools)
-    generation_config = build_generation_config(payload)
+    tools = convert_tools(filter_tools_for_antigravity(payload.get("tools")))
 
     return {
         "model": model,
