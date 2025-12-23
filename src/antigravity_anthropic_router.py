@@ -349,11 +349,6 @@ def _payload_mentions_web_search(payload: Dict[str, Any]) -> bool:
             if "web search" in text.lower():
                 return True
 
-    system_blocks = payload.get("system") or []
-    for text in _texts_from_blocks(system_blocks):
-        if "web search" in text.lower():
-            return True
-
     return False
 
 
@@ -918,6 +913,42 @@ async def anthropic_messages(
                 block_type = block.get("type", "text")
 
                 if block_type in {"tool_use", "tool_result"}:
+                    if block_type == "tool_use":
+                        tool_input = block.get("input") if isinstance(block, dict) else None
+                        if not isinstance(tool_input, dict):
+                            tool_input = {}
+                        yield _sse_event(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": idx,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": block.get("id"),
+                                    "name": block.get("name"),
+                                    "input": {},
+                                },
+                            },
+                        )
+                        yield _sse_event(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": json.dumps(
+                                        tool_input, ensure_ascii=False, separators=(",", ":")
+                                    ),
+                                },
+                            },
+                        )
+                        yield _sse_event(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": idx},
+                        )
+                        continue
+
                     yield _sse_event(
                         "content_block_start",
                         {
