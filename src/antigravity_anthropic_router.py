@@ -206,6 +206,11 @@ def _infer_project_and_session(credential_data: Dict[str, Any]) -> tuple[str, st
     return str(project_id), str(session_id)
 
 
+def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
+
+
 def _is_search_tool_name(name: str) -> bool:
     return "search" in str(name or "").lower()
 
@@ -579,43 +584,6 @@ async def anthropic_messages(
         api_payload = {"model": components["model"], "request": request_data}
         cred_mgr = await get_credential_manager()
 
-        if stream:
-            message_id = f"msg_{uuid.uuid4().hex}"
-            response = await send_gemini_request(api_payload, True, cred_mgr)
-            if getattr(response, "status_code", 200) != 200:
-                return _anthropic_error(
-                    status_code=getattr(response, "status_code", 500),
-                    message="ä¸‹æ¸¸è¯·æ±‚å¤±è´¥",
-                    error_type="api_error",
-                )
-
-            async def line_iter():
-                if hasattr(response, "body_iterator"):
-                    async for chunk in response.body_iterator:
-                        if not chunk:
-                            continue
-                        text = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
-                        for line in text.splitlines():
-                            if line:
-                                yield line
-                else:
-                    body = getattr(response, "body", None) or getattr(response, "content", None) or ""
-                    text = body.decode("utf-8", errors="ignore") if isinstance(body, bytes) else str(body)
-                    for line in text.splitlines():
-                        if line:
-                            yield line
-
-            async def stream_generator():
-                async for chunk in gemini_sse_to_anthropic_sse(
-                    line_iter(),
-                    model=str(model),
-                    message_id=message_id,
-                    initial_input_tokens=estimated_tokens,
-                ):
-                    yield chunk
-
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-
         response = await send_gemini_request(api_payload, False, cred_mgr)
         if getattr(response, "status_code", 200) != 200:
             return _anthropic_error(
@@ -644,7 +612,74 @@ async def anthropic_messages(
             message_id=request_id,
             fallback_input_tokens=estimated_tokens,
         )
-        return JSONResponse(content=anthropic_response)
+        if not stream:
+            return JSONResponse(content=anthropic_response)
+
+        async def stream_generator():
+            usage = anthropic_response.get("usage", {}) or {}
+            yield _sse_event(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": anthropic_response.get("id", request_id),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": anthropic_response.get("model", str(model)),
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {
+                            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                            "output_tokens": 0,
+                        },
+                    },
+                },
+            )
+
+            content_blocks = anthropic_response.get("content", []) or []
+            for idx, block in enumerate(content_blocks):
+                if not isinstance(block, dict):
+                    block = {"type": "text", "text": str(block)}
+                block_type = block.get("type", "text")
+
+                yield _sse_event(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": idx,
+                        "content_block": {"type": block_type, **{k: v for k, v in block.items() if k != "type"}},
+                    },
+                )
+
+                if block_type == "thinking":
+                    delta = {"type": "thinking_delta", "thinking": block.get("thinking", "")}
+                else:
+                    delta = {"type": "text_delta", "text": block.get("text", "")}
+
+                yield _sse_event(
+                    "content_block_delta",
+                    {"type": "content_block_delta", "index": idx, "delta": delta},
+                )
+                yield _sse_event(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": idx},
+                )
+
+            yield _sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": anthropic_response.get("stop_reason"), "stop_sequence": None},
+                    "usage": {
+                        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+                        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+                    },
+                },
+            )
+            yield _sse_event("message_stop", {"type": "message_stop"})
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
     cred_mgr = await get_credential_manager()
     cred_result = await cred_mgr.get_valid_credential(is_antigravity=True)
