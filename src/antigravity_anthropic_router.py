@@ -752,6 +752,7 @@ async def anthropic_messages(
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
+                    "name": tool_name,
                     "content": [{"type": "text", "text": tool_result_text}],
                 },
                 {"type": "text", "text": summary},
