@@ -715,20 +715,7 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
     contents = reorganize_tool_messages(contents)
     system_instruction = build_system_instruction(payload.get("system"))
     raw_tools = payload.get("tools")
-    search_requested = False
-    if isinstance(raw_tools, list):
-        for tool in raw_tools:
-            if not isinstance(tool, dict):
-                continue
-            if _is_search_tool_name(tool.get("name", "")) or _is_search_tool_name(tool.get("type", "")):
-                search_requested = True
-                break
-
-    if search_requested:
-        model = "gemini-3-flash-preview-search"
-        tools = [{"googleSearch": {}}]
-    else:
-        tools = convert_tools(filter_tools_for_antigravity(raw_tools))
+    tools = convert_tools(filter_tools_for_antigravity(raw_tools))
 
     return {
         "model": model,

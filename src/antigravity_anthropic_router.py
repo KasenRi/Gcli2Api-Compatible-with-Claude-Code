@@ -215,15 +215,34 @@ def _is_search_tool_name(name: str) -> bool:
     return "search" in str(name or "").lower()
 
 
-def _has_search_tool(payload: Dict[str, Any]) -> bool:
+def _is_search_requested(payload: Dict[str, Any]) -> bool:
     tools = payload.get("tools")
-    if not isinstance(tools, list):
+    if not isinstance(tools, list) or not tools:
         return False
+
+    search_tools = []
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         if _is_search_tool_name(tool.get("name", "")) or _is_search_tool_name(tool.get("type", "")):
+            search_tools.append(tool)
+
+    if not search_tools:
+        return False
+
+    tool_choice = payload.get("tool_choice") or payload.get("toolChoice")
+    if isinstance(tool_choice, str):
+        return _is_search_tool_name(tool_choice)
+
+    if isinstance(tool_choice, dict):
+        name = tool_choice.get("name") or tool_choice.get("tool_name") or ""
+        if _is_search_tool_name(name):
             return True
+        choice_type = str(tool_choice.get("type", "")).lower()
+        if choice_type in {"tool", "required"} and len(search_tools) == 1:
+            return True
+        return False
+
     return False
 
 def _pick_usage_metadata_from_antigravity_response(response_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -544,7 +563,7 @@ async def anthropic_messages(
 
     from src.credential_manager import get_credential_manager
 
-    if _has_search_tool(payload):
+    if _is_search_requested(payload):
         try:
             components = convert_anthropic_request_to_antigravity_components(payload)
         except Exception as e:
@@ -553,7 +572,7 @@ async def anthropic_messages(
                 status_code=400, message="è¯·æ±‚è½¬æ¢å¤±è´¥", error_type="invalid_request_error"
             )
 
-        components["model"] = "gemini-3-flash-preview-search"
+        components["model"] = "gemini-3-flash-preview"
         components["tools"] = [{"googleSearch": {}}]
         log.info(
             f"[ANTHROPIC] search æ¨¡å¼ï¼Œè½¬å‘åˆ° /v1/chat/completions ï¼ˆmodel={components['model']}ï¼‰"
