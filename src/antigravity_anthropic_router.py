@@ -865,6 +865,7 @@ async def anthropic_messages(
     log.info(f"[ANTHROPIC] /messages model mapping: upstream={model} -> downstream={components['model']}")
 
     # Downstream requires each text block to be non-empty; ensure contents is not empty.
+    if not components.get("contents"):
         return _anthropic_error(
             status_code=400,
             message="messages cannot be empty; text blocks must be non-empty",
