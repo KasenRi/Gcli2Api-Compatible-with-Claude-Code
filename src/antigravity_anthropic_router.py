@@ -204,6 +204,59 @@ def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
 def _is_search_tool_name(name: str) -> bool:
     return "search" in str(name or "").lower()
 
+def _is_web_search_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    name = str(tool.get("name") or "").lower()
+    tool_type = str(tool.get("type") or "").lower()
+    return name.startswith("web_search") or tool_type.startswith("web_search")
+
+def _is_system_reminder_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "<system-reminder" in lowered:
+        return True
+    return "todo list is currently empty" in lowered
+
+def _filter_system_reminders(system: Any) -> Any:
+    if not system:
+        return system
+    if isinstance(system, list):
+        kept: List[Any] = []
+        for item in system:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text") or ""
+                if _is_system_reminder_text(text):
+                    continue
+            elif isinstance(item, str) and _is_system_reminder_text(item):
+                continue
+            kept.append(item)
+        return kept or None
+    if isinstance(system, dict) and system.get("type") == "text":
+        if _is_system_reminder_text(system.get("text") or ""):
+            return None
+    if isinstance(system, str) and _is_system_reminder_text(system):
+        return None
+    return system
+
+def _filter_system_reminder_messages(messages: Any) -> List[Dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    kept: List[Dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "system":
+            text = _anthropic_content_to_text(msg.get("content"))
+            if _is_system_reminder_text(text):
+                continue
+        kept.append(msg)
+    return kept
+
+def _filter_web_search_tools(tools: Any) -> Any:
+    if not isinstance(tools, list):
+        return tools
+    return [tool for tool in tools if not _is_web_search_tool(tool)]
+
 def _append_system_instruction(system_instruction: Optional[Dict[str, Any]], extra_text: str) -> Dict[str, Any]:
     if not extra_text:
         return system_instruction or {"role": "user", "parts": []}
@@ -344,6 +397,8 @@ def _payload_mentions_web_search(payload: Dict[str, Any]) -> bool:
     messages = payload.get("messages") or []
     for msg in messages:
         if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
             continue
         for text in _texts_from_blocks(msg.get("content")):
             if "web search" in text.lower():
@@ -751,6 +806,13 @@ async def anthropic_messages(
         f"thinking={thinking_summary}, ua={user_agent}"
     )
 
+    is_claude_cli = "claude-cli" in user_agent.lower() or "claude-code" in user_agent.lower()
+    effective_payload = payload
+    if is_claude_cli:
+        effective_payload = dict(payload)
+        effective_payload["system"] = _filter_system_reminders(payload.get("system"))
+        effective_payload["messages"] = _filter_system_reminder_messages(payload.get("messages") or [])
+
     if len(messages) == 1 and messages[0].get("role") == "user" and messages[0].get("content") == "Hi":
         return JSONResponse(
             content={
@@ -769,8 +831,9 @@ async def anthropic_messages(
 
     from src.credential_manager import get_credential_manager
 
-    if _is_search_requested(payload):
-        openai_messages = _anthropic_payload_to_openai_messages(payload)
+    if _is_search_requested(effective_payload):
+        emit_tool_blocks = not is_claude_cli
+        openai_messages = _anthropic_payload_to_openai_messages(effective_payload)
         if not openai_messages:
             return _anthropic_error(
                 status_code=400,
@@ -779,7 +842,7 @@ async def anthropic_messages(
             )
 
         stop_value = None
-        stop_sequences = payload.get("stop_sequences")
+        stop_sequences = effective_payload.get("stop_sequences")
         if isinstance(stop_sequences, str) and stop_sequences:
             stop_value = stop_sequences
         elif isinstance(stop_sequences, list):
@@ -791,8 +854,8 @@ async def anthropic_messages(
             model="gemini-3-flash-preview-search",
             messages=openai_messages,
             stream=False,
-            temperature=payload.get("temperature"),
-            top_p=payload.get("top_p"),
+            temperature=effective_payload.get("temperature"),
+            top_p=effective_payload.get("top_p"),
             max_tokens=int(max_tokens) if max_tokens is not None else None,
             stop=stop_value,
             top_k=64,
@@ -804,7 +867,7 @@ async def anthropic_messages(
 
         estimated_tokens = 0
         try:
-            estimated_tokens = estimate_input_tokens(payload)
+            estimated_tokens = estimate_input_tokens(effective_payload)
         except Exception as e:
             log.debug(f"[ANTHROPIC] token estimate failed: {e}")
 
@@ -846,7 +909,7 @@ async def anthropic_messages(
         if not query:
             query = grounding_query
         if not query:
-            query = str(_infer_search_query(payload) or "")
+            query = str(_infer_search_query(effective_payload) or "")
         if not results and grounding_results:
             results = grounding_results
 
@@ -854,17 +917,18 @@ async def anthropic_messages(
         if not query:
             query = "web search"
 
-        tool_name = _extract_search_tool_name(payload)
+        tool_name = _extract_search_tool_name(effective_payload)
         tool_use_id = f"toolu_{uuid.uuid4().hex}"
         tool_result_payload = {"query": query, "results": results}
         tool_result_text = json.dumps(tool_result_payload, ensure_ascii=False, separators=(",", ":"))
 
-        anthropic_response = {
-            "id": request_id,
-            "type": "message",
-            "role": "assistant",
-            "model": str(model),
-            "content": [
+        summary_text = summary
+        if not isinstance(summary_text, str):
+            summary_text = str(summary_text or "")
+
+        content_blocks: List[Dict[str, Any]]
+        if emit_tool_blocks:
+            content_blocks = [
                 {"type": "tool_use", "id": tool_use_id, "name": tool_name, "input": {"query": query}},
                 {
                     "type": "tool_result",
@@ -872,8 +936,17 @@ async def anthropic_messages(
                     "name": tool_name,
                     "content": [{"type": "text", "text": tool_result_text}],
                 },
-                {"type": "text", "text": summary},
-            ],
+                {"type": "text", "text": summary_text},
+            ]
+        else:
+            content_blocks = [{"type": "text", "text": summary_text}]
+
+        anthropic_response = {
+            "id": request_id,
+            "type": "message",
+            "role": "assistant",
+            "model": str(model),
+            "content": content_blocks,
             "stop_reason": "end_turn",
             "stop_sequence": None,
             "usage": {
@@ -1008,8 +1081,13 @@ async def anthropic_messages(
     _, credential_data = cred_result
     project_id, session_id = _infer_project_and_session(credential_data)
 
+    payload_for_conversion = effective_payload
+    if is_claude_cli:
+        payload_for_conversion = dict(effective_payload)
+        payload_for_conversion["tools"] = _filter_web_search_tools(effective_payload.get("tools"))
+
     try:
-        components = convert_anthropic_request_to_antigravity_components(payload)
+        components = convert_anthropic_request_to_antigravity_components(payload_for_conversion)
     except Exception as e:
         log.error(f"[ANTHROPIC] request conversion failed: {e}")
         return _anthropic_error(
@@ -1029,7 +1107,7 @@ async def anthropic_messages(
     # Rough token estimate
     estimated_tokens = 0
     try:
-        estimated_tokens = estimate_input_tokens(payload)
+        estimated_tokens = estimate_input_tokens(payload_for_conversion)
     except Exception as e:
         log.debug(f"[ANTHROPIC] token estimate failed: {e}")
 
