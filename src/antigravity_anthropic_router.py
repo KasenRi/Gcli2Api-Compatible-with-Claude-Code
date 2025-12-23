@@ -4,7 +4,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 
 from fastapi import APIRouter, Depends, Request
@@ -219,13 +219,54 @@ def _append_system_instruction(system_instruction: Optional[Dict[str, Any]], ext
     return {"role": "user", "parts": [{"text": extra_text}]}
 
 def _extract_text_from_gemini_response(response_data: Dict[str, Any]) -> str:
-    candidate = response_data.get("candidates", [{}])[0] or {}
+    data = response_data
+    if not isinstance(data, dict):
+        return ""
+    if "candidates" not in data and isinstance(data.get("response"), dict):
+        data = data.get("response") or {}
+    candidate = (data.get("candidates") or [{}])[0] or {}
     parts = candidate.get("content", {}).get("parts", []) or []
     texts = []
     for part in parts:
         if isinstance(part, dict) and "text" in part:
             texts.append(str(part.get("text") or ""))
     return "\n".join([t for t in texts if t])
+
+def _extract_grounding_metadata(response_data: Dict[str, Any]) -> Dict[str, Any]:
+    data = response_data
+    if not isinstance(data, dict):
+        return {}
+    if "candidates" not in data and isinstance(data.get("response"), dict):
+        data = data.get("response") or {}
+    candidate = (data.get("candidates") or [{}])[0] or {}
+    grounding = candidate.get("groundingMetadata") or {}
+    return grounding if isinstance(grounding, dict) else {}
+
+def _grounding_metadata_to_search(
+    grounding: Dict[str, Any]
+) -> Tuple[str, List[Dict[str, str]]]:
+    query = ""
+    web_queries = grounding.get("webSearchQueries")
+    if isinstance(web_queries, list) and web_queries:
+        first = web_queries[0]
+        if isinstance(first, str):
+            query = first.strip()
+
+    results: List[Dict[str, str]] = []
+    chunks = grounding.get("groundingChunks") or []
+    if isinstance(chunks, list):
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            web = chunk.get("web") or {}
+            if not isinstance(web, dict):
+                continue
+            title = str(web.get("title") or "").strip()
+            uri = str(web.get("uri") or "").strip()
+            snippet = str(web.get("snippet") or "").strip() if isinstance(web.get("snippet"), str) else ""
+            if title or uri or snippet:
+                results.append({"title": title, "url": uri, "snippet": snippet})
+    return query, results
 
 def _parse_search_json(text: str) -> Dict[str, Any]:
     if not isinstance(text, str):
@@ -671,7 +712,7 @@ async def anthropic_messages(
                 status_code=400, message="request conversion failed", error_type="invalid_request_error"
             )
 
-        # Use a search-capable model that确实存在于 /v1/models 列表，避免 404
+        # Use a search-capable model from /v1/models to avoid 404.
         components["model"] = "gemini-2.5-flash-search"
         components["tools"] = [{"googleSearch": {}}]
         components["system_instruction"] = _append_system_instruction(
@@ -732,11 +773,20 @@ async def anthropic_messages(
 
         raw_text = _extract_text_from_gemini_response(response_data)
         parsed = _parse_search_json(raw_text)
-        query = str(parsed.get("query") or _infer_search_query(payload) or "")
+        query = str(parsed.get("query") or "")
         results = parsed.get("results")
         if not isinstance(results, list):
             results = []
         summary = str(parsed.get("summary") or raw_text or "")
+
+        grounding = _extract_grounding_metadata(response_data)
+        grounding_query, grounding_results = _grounding_metadata_to_search(grounding)
+        if not query:
+            query = grounding_query
+        if not query:
+            query = str(_infer_search_query(payload) or "")
+        if not results and grounding_results:
+            results = grounding_results
 
         tool_name = _extract_search_tool_name(payload)
         tool_use_id = f"toolu_{uuid.uuid4().hex}"
