@@ -407,6 +407,29 @@ def _payload_mentions_web_search(payload: Dict[str, Any]) -> bool:
     return False
 
 
+def _system_mentions_web_search(payload: Dict[str, Any]) -> bool:
+    system = payload.get("system")
+    if not system:
+        return False
+    texts: List[str] = []
+    if isinstance(system, str):
+        texts.append(system)
+    elif isinstance(system, list):
+        for item in system:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                texts.append(str(item.get("text") or ""))
+    elif isinstance(system, dict) and system.get("type") == "text":
+        texts.append(str(system.get("text") or ""))
+
+    for text in texts:
+        lowered = text.lower()
+        if "web search tool use" in lowered or "web search" in lowered:
+            return True
+    return False
+
+
 def _normalize_search_query(query: str) -> str:
     text = str(query or "").strip()
     if not text:
@@ -489,6 +512,9 @@ def _is_search_requested(payload: Dict[str, Any]) -> bool:
 
     if not search_tools:
         return False
+
+    if _system_mentions_web_search(payload):
+        return True
 
     tool_choice = payload.get("tool_choice") or payload.get("toolChoice")
     if isinstance(tool_choice, str):
