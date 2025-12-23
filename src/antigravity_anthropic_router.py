@@ -21,6 +21,8 @@ from .antigravity_api import (
 from .anthropic_converter import convert_anthropic_request_to_antigravity_components
 from .anthropic_streaming import antigravity_sse_to_anthropic_sse, gemini_sse_to_anthropic_sse
 from .gcli_chat_api import send_gemini_request
+from .models import ChatCompletionRequest
+from .openai_transfer import openai_request_to_gemini_payload
 from .token_estimator import estimate_input_tokens
 
 router = APIRouter()
@@ -352,6 +354,54 @@ def _payload_mentions_web_search(payload: Dict[str, Any]) -> bool:
             return True
 
     return False
+
+
+def _anthropic_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts: List[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "")
+                if text:
+                    texts.append(text)
+        return "\n".join(texts).strip()
+    return ""
+
+
+def _anthropic_payload_to_openai_messages(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    openai_messages: List[Dict[str, Any]] = []
+
+    system_blocks = payload.get("system")
+    if isinstance(system_blocks, list):
+        system_texts: List[str] = []
+        for block in system_blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = str(block.get("text") or "")
+                if text:
+                    system_texts.append(text)
+            elif isinstance(block, str):
+                if block.strip():
+                    system_texts.append(block)
+        if system_texts:
+            openai_messages.append({"role": "system", "content": "\n".join(system_texts)})
+    elif isinstance(system_blocks, str) and system_blocks.strip():
+        openai_messages.append({"role": "system", "content": system_blocks})
+
+    messages = payload.get("messages") or []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        text = _anthropic_content_to_text(msg.get("content"))
+        if not text:
+            continue
+        openai_messages.append({"role": role, "content": text})
+
+    return openai_messages
 
 
 def _is_search_requested(payload: Dict[str, Any]) -> bool:
@@ -704,32 +754,37 @@ async def anthropic_messages(
     from src.credential_manager import get_credential_manager
 
     if _is_search_requested(payload):
-        try:
-            components = convert_anthropic_request_to_antigravity_components(payload)
-        except Exception as e:
-            log.error(f"[ANTHROPIC] request conversion failed: {e}")
-            return _anthropic_error(
-                status_code=400, message="request conversion failed", error_type="invalid_request_error"
-            )
-
-        # Use a search-capable model from /v1/models to avoid 404.
-        components["model"] = "gemini-2.5-flash-search"
-        components["tools"] = [{"googleSearch": {}}]
-        components["system_instruction"] = _append_system_instruction(
-            components.get("system_instruction"),
-            "Return ONLY valid JSON with keys: query (string), results (array of {title,url,snippet}), summary (string). "
-            "No markdown, no extra text.",
-        )
-        log.info(
-            f"[ANTHROPIC] search mode: route to /gapi/v1/chat/completions (model={components['model']})"
-        )
-
-        if not (components.get("contents") or []):
+        openai_messages = _anthropic_payload_to_openai_messages(payload)
+        if not openai_messages:
             return _anthropic_error(
                 status_code=400,
                 message="messages cannot be empty; text blocks must be non-empty",
                 error_type="invalid_request_error",
             )
+
+        stop_value = None
+        stop_sequences = payload.get("stop_sequences")
+        if isinstance(stop_sequences, str) and stop_sequences:
+            stop_value = stop_sequences
+        elif isinstance(stop_sequences, list):
+            stop_list = [str(item) for item in stop_sequences if item]
+            if stop_list:
+                stop_value = stop_list
+
+        request_data = ChatCompletionRequest(
+            model="gemini-3-flash-preview-search",
+            messages=openai_messages,
+            stream=False,
+            temperature=payload.get("temperature"),
+            top_p=payload.get("top_p"),
+            max_tokens=int(max_tokens) if max_tokens is not None else None,
+            stop=stop_value,
+            top_k=64,
+        )
+
+        log.info(
+            f"[ANTHROPIC] search mode: route to /v1/chat/completions (model={request_data.model})"
+        )
 
         estimated_tokens = 0
         try:
@@ -737,16 +792,7 @@ async def anthropic_messages(
         except Exception as e:
             log.debug(f"[ANTHROPIC] token estimate failed: {e}")
 
-        request_data: Dict[str, Any] = {
-            "contents": components["contents"],
-            "generationConfig": components["generation_config"],
-        }
-        if components.get("system_instruction"):
-            request_data["systemInstruction"] = components["system_instruction"]
-        if components.get("tools"):
-            request_data["tools"] = components["tools"]
-
-        api_payload = {"model": components["model"], "request": request_data}
+        api_payload = await openai_request_to_gemini_payload(request_data)
         cred_mgr = await get_credential_manager()
 
         response = await send_gemini_request(api_payload, False, cred_mgr)
