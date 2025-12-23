@@ -286,6 +286,54 @@ def filter_tools_for_antigravity(
     return None
 
 
+def _ensure_input_schema_type(schema: Any) -> Dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {"type": "object"}
+    if "type" not in schema:
+        schema["type"] = "object"
+    return schema
+
+
+def convert_anthropic_tools_to_antigravity_custom(
+    anthropic_tools: Optional[List[Dict[str, Any]]]
+) -> Optional[List[Dict[str, Any]]]:
+    if not anthropic_tools:
+        return None
+
+    converted: List[Dict[str, Any]] = []
+    for tool in anthropic_tools:
+        if not isinstance(tool, dict):
+            continue
+
+        if isinstance(tool.get("custom"), dict):
+            custom = dict(tool.get("custom") or {})
+            input_schema = clean_json_schema(custom.get("input_schema", {}))
+            input_schema = _ensure_input_schema_type(input_schema)
+            custom["input_schema"] = input_schema
+            tool_type = tool.get("type") or "custom"
+            converted.append({"type": tool_type, "custom": custom})
+            continue
+
+        name = tool.get("name")
+        if not name:
+            continue
+        description = tool.get("description", "")
+        input_schema = clean_json_schema(tool.get("input_schema", {}))
+        input_schema = _ensure_input_schema_type(input_schema)
+        converted.append(
+            {
+                "type": "custom",
+                "custom": {
+                    "name": name,
+                    "description": description,
+                    "input_schema": input_schema,
+                },
+            }
+        )
+
+    return converted or None
+
+
 def _extract_tool_result_output(content: Any) -> str:
     """
     从 tool_result.content 中提取输出字符串（按 converter.py 的最小语义）。
@@ -630,6 +678,20 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
     if not isinstance(messages, list):
         messages = []
 
+    last_assistant_first_block_type = None
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list) or not content:
+            continue
+        first_block = content[0]
+        if isinstance(first_block, dict):
+            last_assistant_first_block_type = first_block.get("type")
+        break
+
     thinking_value = payload.get("thinking", None) if "thinking" in payload else None
     allow_thinking = False
     if thinking_value is None:
@@ -641,10 +703,17 @@ def convert_anthropic_request_to_antigravity_components(payload: Dict[str, Any])
     else:
         allow_thinking = True
 
+    if allow_thinking and last_assistant_first_block_type not in {None, "thinking", "redacted_thinking"}:
+        allow_thinking = False
+
     contents = convert_messages_to_contents(messages, allow_thinking=allow_thinking)
     contents = reorganize_tool_messages(contents)
     system_instruction = build_system_instruction(payload.get("system"))
-    tools = convert_tools(filter_tools_for_antigravity(payload.get("tools")))
+    filtered_tools = filter_tools_for_antigravity(payload.get("tools"))
+    if str(model).startswith("claude-"):
+        tools = convert_anthropic_tools_to_antigravity_custom(filtered_tools)
+    else:
+        tools = convert_tools(filtered_tools)
     generation_config = build_generation_config(payload)
 
     return {
